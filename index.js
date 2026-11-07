@@ -5,6 +5,7 @@ import {
 } from 'discord.js';
 import cron from 'node-cron';
 import axios from 'axios';
+import { GoogleGenAI } from '@google/genai';
 import { db, ref, get, set, remove } from './firebase.js';
 import dotenv from 'dotenv';
 dotenv.config();
@@ -15,55 +16,90 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]
 });
 
-// Pomocná funkce pro svátky v ČR
-async function getTodayHoliday() {
-  try {
-    const res = await axios.get('https://api.abalin.net/today?country=cz');
-    if (res.data && res.data.data && res.data.data.name_cz) {
-      return res.data.data.name_cz;
-    }
-  } catch (e) {
-    console.error("Chyba při stahování svátků:", e.message);
-  }
-  return "Neznámý svátek";
-}
+// Inicializace Google GenAI (využívá GEMINI_API_KEY z prostředí)
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// Pomocná funkce pro počasí
+// Funkce pro získání detailního počasí v °C (ráno, poledne, večer přes wttr.in)
 async function getWeather(city = "Opava") {
   try {
-    const res = await axios.get(`https://wttr.in/${encodeURIComponent(city)}?format=%C+%t`, { responseType: 'text' });
+    // S hlavičkou curl vrátí wttr.in krásnou textovou předpověď včetně částí dne a °C
+    const res = await axios.get(`https://wttr.in/${encodeURIComponent(city)}?format=3`, { 
+      headers: { 'User-Agent': 'curl' },
+      responseType: 'text' 
+    });
     return res.data.trim();
   } catch (e) {
-    return "Nepodařilo se načíst počasí";
+    return "Počasí momentálně není k dispozici.";
   }
 }
 
-// Funkce pro ranní rozesílku
+// Funkce pro generování obsahu pomocí AI (svátky, události, novinky, doporučení)
+async function getAIGeneratedContent(cityName) {
+  const todayStr = new Date().toLocaleDateString('cs-CZ', { day: 'numeric', month: 'long', year: 'numeric' });
+  const weatherData = await getWeather(cityName);
+
+  const prompt = `
+Dnes je ${todayStr}. Jsi chytrý ranní asistent pro Discord bota "Ranní ptáče".
+Pro město "${cityName}" je aktuální předpověď počasí: "${weatherData}".
+
+Vrať mi odpověď POUZE jako čistý JSON objekt (bez jakýchkoliv markdown značek jako \`\`\`json, jen čistý řetězec JSON) s těmito přesnými klíči:
+- "svatek": Přesné jméno/jména lidí, kteří mají dnes v České republice svátek.
+- "udalost": Státní svátek, významný den nebo historická událost připadající na dnešní den v ČR (pokud je to běžný pracovní den bez významu, napiš "Běžný pracovní den" nebo uveď co se slaví).
+- "novinky": Krátká, zajímavá zpráva, technologický nebo světový střípek z včerejšího dne (1-2 věty).
+- "doporuceni": Praktické ranní doporučení pro uživatele na základě počasí a dne (např. "Vezmi si deštník, odpoledne bude pršet", "Nezapomeň sluneční brýle", "Venku mrzne, obleč se teple").
+- "zajimavost": Krátká zajímavost nebo tip do nového dne.
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+    });
+
+    const text = response.text.trim();
+    const cleanedJson = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(cleanedJson);
+  } catch (err) {
+    console.error("Chyba při generování AI obsahu:", err);
+    return {
+      svatek: "Dnes má svátek dle kalendáře",
+      udalost: "Běžný den",
+      novinky: "Včerejšek přinesl zajímavé novinky ze světa technologií i událostí.",
+      doporuceni: "Měj parádní den, úsměv na tváři a dobrou náladu!",
+      zajimavost: "Pravidelný ranní režim prokazatelně zvyšuje produktivitu."
+    };
+  }
+}
+
+// Hlavní funkce pro rozesílku ranního přehledu
 async function sendMorningNews() {
   const snapshot = await get(ref(db, 'subscribers'));
   if (!snapshot.exists()) return;
 
   const subscribers = snapshot.val();
-  const holiday = await getTodayHoliday();
+  const todayFormatted = new Date().toLocaleDateString('cs-CZ', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 
   for (const [userId, data] of Object.entries(subscribers)) {
     if (!data.active) continue;
 
     try {
       const city = data.city || 'Opava';
-      const weather = await getWeather(city);
+      const aiData = await getAIGeneratedContent(city);
+      const weatherText = await getWeather(city);
       
       const embed = new EmbedBuilder()
-        .setColor('#FFA500')
-        .setTitle('🌅 Dobré ráno, Ranní ptáče!')
-        .setDescription('Tady je tvůj pravidelný ranní přehled do nového dne.')
+        .setColor('#00FFA3')
+        .setTitle(`🌅 Dobré ráno, Ranní ptáče!`)
+        .setDescription(`📅 **Dnes je:** ${todayFormatted}`)
         .addFields(
-          { name: '📅 Dnes má svátek', value: `**${holiday}**`, inline: false },
-          { name: `⛅ Počasí (${city})`, value: weather, inline: false },
-          { name: '💡 Dnešní zajímavost', value: 'Věděl jsi, že pravidelný ranní režim zvyšuje produktivitu během dne až o 30 %?', inline: false }
+          { name: '🎉 Svátek & Významné události', value: `• **Svátek:** ${aiData.svatek}\n• **Událost:** ${aiData.udalost}`, inline: false },
+          { name: `⛅ Počasí v °C (${city})`, value: `\`\`\`${weatherText}\`\`\``, inline: false },
+          { name: '💡 Ranní doporučení', value: `👉 ${aiData.doporuceni}`, inline: false },
+          { name: '📰 Novinky ze včerejška', value: aiData.novinky, inline: false },
+          { name: '✨ Dnešní zajímavost', value: aiData.zajimavost, inline: false }
         )
         .setTimestamp()
-        .setFooter({ text: 'Ranní ptáče • Váš ranní průvodce' });
+        .setFooter({ text: 'Ranní ptáče • Poháněno AI & Google Gemini' });
 
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -83,7 +119,6 @@ async function sendMorningNews() {
 client.once('ready', async () => {
   console.log(`🤖 Bot ${client.user.tag} je online!`);
 
-  // Registrace slash příkazů
   const commands = [
     new SlashCommandBuilder()
       .setName('adminpanel')
@@ -102,10 +137,8 @@ client.once('ready', async () => {
   }
 });
 
-// Zpracování interakcí (Slash příkazy, Tlačítka, Modals)
 client.on('interactionCreate', async interaction => {
   try {
-    // 1. Slash příkazy
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'adminpanel') {
         if (interaction.user.id !== OWNER_ID) {
@@ -115,7 +148,7 @@ client.on('interactionCreate', async interaction => {
         const adminEmbed = new EmbedBuilder()
           .setColor('#2b2d31')
           .setTitle('🛠️ Ranní ptáče – Admin Panel')
-          .setDescription('Vítej v administraci bota. Zde můžeš spravovat nastavení a testovat rozesílku.');
+          .setDescription('Správa bota a AI generátoru.');
 
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
@@ -124,7 +157,7 @@ client.on('interactionCreate', async interaction => {
             .setStyle(ButtonStyle.Primary),
           new ButtonBuilder()
             .setCustomId('admin_test')
-            .setLabel('🧪 Test rozesílky')
+            .setLabel('🧪 Test rozesílky s AI')
             .setStyle(ButtonStyle.Success)
         );
 
@@ -133,13 +166,13 @@ client.on('interactionCreate', async interaction => {
 
       if (interaction.commandName === 'setup') {
         if (interaction.user.id !== OWNER_ID) {
-          return interaction.reply({ content: '❌ Pouze majitel může nastavit odběrový kanál.', ephemeral: true });
+          return interaction.reply({ content: '❌ Pouze majitel.', ephemeral: true });
         }
 
         const publicEmbed = new EmbedBuilder()
           .setColor('#0099ff')
           .setTitle('🌅 Ranní ptáče – Odběr novinek')
-          .setDescription('Chceš každé ráno dostávat do DM přehled svátků, počasí a zajímavostí?\n\nStiskni tlačítko níže a přihlas se k odběru!');
+          .setDescription('Chceš každé ráno dostávat do DM moderní přehled s aktuálním datem, svátky, počasím v °C, AI doporučením a novinkami ze včerejška?\n\nStiskni tlačítko níže!');
 
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
@@ -149,24 +182,22 @@ client.on('interactionCreate', async interaction => {
         );
 
         await interaction.channel.send({ embeds: [publicEmbed], components: [row] });
-        return interaction.reply({ content: '✅ Odběrový panel byl úspěšně odeslán do tohoto kanálu!', ephemeral: true });
+        return interaction.reply({ content: '✅ Panel odeslán!', ephemeral: true });
       }
     }
 
-    // 2. Kliknutí na tlačítka
     if (interaction.isButton()) {
       if (interaction.customId === 'open_sub_modal') {
-        // Otevření modálního okna pro zadání města
         const modal = new ModalBuilder()
           .setCustomId('sub_modal')
           .setTitle('Nastavení odběru Ranního ptáčete');
 
         const cityInput = new TextInputBuilder()
           .setCustomId('city_input')
-          .setLabel('Tvoje město (pro počasí):')
+          .setLabel('Tvoje město (pro předpověď počasí):')
           .setPlaceholder('např. Opava')
           .setStyle(TextInputStyle.Short)
-          .setRequired(false); // Nepovinné
+          .setRequired(false);
 
         modal.addComponents(new ActionRowBuilder().addComponents(cityInput));
         return await interaction.showModal(modal);
@@ -182,21 +213,20 @@ client.on('interactionCreate', async interaction => {
         if (interaction.user.id !== OWNER_ID) return;
         const snap = await get(ref(db, 'subscribers'));
         const count = snap.exists() ? Object.keys(snap.val()).length : 0;
-        return interaction.reply({ content: `📊 Aktuální počet odběratelů: **${count}**`, ephemeral: true });
+        return interaction.reply({ content: `📊 Odběratelů: **${count}**`, ephemeral: true });
       }
 
       if (interaction.customId === 'admin_test') {
         if (interaction.user.id !== OWNER_ID) return;
-        await interaction.reply({ content: '🧪 Spouštím testovací ranní rozesílku...', ephemeral: true });
+        await interaction.reply({ content: '🧪 Spouštím testovací ranní rozesílku s AI...', ephemeral: true });
         await sendMorningNews();
       }
     }
 
-    // 3. Odeslání modálního okna (zpracování města)
     if (interaction.isModalSubmit()) {
       if (interaction.customId === 'sub_modal') {
         let city = interaction.fields.getTextInputValue('city_input').trim();
-        if (!city) city = "Opava"; // Výchozí, pokud nevyplní
+        if (!city) city = "Opava";
 
         const userId = interaction.user.id;
         const userRef = ref(db, `subscribers/${userId}`);
@@ -208,13 +238,13 @@ client.on('interactionCreate', async interaction => {
         });
 
         return interaction.reply({
-          content: `✅ Úspěšně přihlášeno k odběru!\nKaždé ráno ti pošlu ranní zprávu s počasím pro město **${city}**.\n*(Město nikde nesdílíme, slouží čistě pro generování počasí).*`,
+          content: `✅ Přihlášeno! Každé ráno ti pošlu přehled pro město **${city}** v °C i s AI doporučením.\n*(Město nikde nesdílíme, slouží čistě pro počasí).*`,
           ephemeral: true
         });
       }
     }
   } catch (err) {
-    console.error("Chyba při zpracování interakce:", err);
+    console.error("Chyba:", err);
   }
 });
 
