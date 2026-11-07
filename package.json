@@ -1,13 +1,14 @@
 {
   "name": "ranni-ptace",
   "version": "1.0.0",
-  "description": "Discord bot Ranní ptáče",
+  "description": "Discord bot Ranní ptáče s AI a Firebase",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "@google/genai": "^0.1.1",
     "axios": "^1.6.8",
     "discord.js": "^14.14.0",
     "dotenv": "^16.4.5",
